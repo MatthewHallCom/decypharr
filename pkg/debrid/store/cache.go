@@ -51,6 +51,7 @@ type CachedTorrent struct {
 	AddedOn    time.Time `json:"added_on"`
 	IsComplete bool      `json:"is_complete"`
 	Bad        bool      `json:"bad"`
+	IsIndexed  bool      `json:"is_indexed"` // false for skeleton entries pending background indexing
 }
 
 func (c CachedTorrent) copy() CachedTorrent {
@@ -59,6 +60,7 @@ func (c CachedTorrent) copy() CachedTorrent {
 		AddedOn:    c.AddedOn,
 		IsComplete: c.IsComplete,
 		Bad:        c.Bad,
+		IsIndexed:  c.IsIndexed,
 	}
 }
 
@@ -115,7 +117,10 @@ type Cache struct {
 	customFolders []string
 	mounter       *rclone.Mount
 	downloadSG    singleflight.Group
+	indexSG       singleflight.Group // deduplicates on-demand index fetches for unindexed torrents
 	streamClient  *http.Client
+
+	backgroundIndexing atomic.Bool // true while background indexing is running
 }
 
 func NewDebridCache(dc config.Debrid, client common.Client, mounter *rclone.Mount) *Cache {
@@ -278,9 +283,14 @@ func (c *Cache) Start(ctx context.Context) error {
 	if err := c.Sync(ctx); err != nil {
 		return fmt.Errorf("failed to sync cache: %w", err)
 	}
-	// Fire the ready channel
+	// Fire the ready channel — WebDAV can serve immediately
 	close(c.ready)
-	c.logger.Info().Msgf("Indexing complete, %d torrents loaded", len(c.torrents.getAll()))
+	unindexedCount := c.countUnindexed()
+	c.logger.Info().Msgf("Indexing complete, %d torrents loaded (%d pending background indexing)",
+		c.torrents.getAllCount(), unindexedCount)
+
+	// Background indexing for skeleton entries
+	go c.backgroundIndex(ctx)
 
 	// initial download links
 	go c.refreshDownloadLinks(ctx)
@@ -378,6 +388,7 @@ func (c *Cache) load(ctx context.Context) (map[string]CachedTorrent, error) {
 							ct.AddedOn = addedOn
 						}
 						ct.IsComplete = true
+						ct.IsIndexed = true // loaded from disk = fully indexed
 						ct.Files = fs
 						ct.Name = path.Clean(ct.Name)
 						mu.Lock()
@@ -458,10 +469,20 @@ func (c *Cache) Sync(ctx context.Context) error {
 	c.logger.Info().Msgf("Loaded %d torrents from cache", len(cachedTorrents))
 
 	if len(newTorrents) > 0 {
-		c.logger.Info().Msgf("Found %d new torrents", len(newTorrents))
-		if err := c.sync(ctx, newTorrents); err != nil {
-			return fmt.Errorf("failed to sync torrents: %v", err)
+		c.logger.Info().Msgf("Found %d new torrents - creating skeleton entries for fast start", len(newTorrents))
+		for _, t := range newTorrents {
+			addedOn, err := time.Parse(time.RFC3339, t.Added)
+			if err != nil {
+				addedOn = time.Now()
+			}
+			ct := CachedTorrent{
+				Torrent:   t,
+				IsIndexed: false, // skeleton — no file details yet
+				AddedOn:   addedOn,
+			}
+			c.addSkeletonTorrent(ct)
 		}
+		c.listingDebouncer.Call(false)
 	}
 
 	return nil
@@ -742,6 +763,7 @@ func (c *Cache) ProcessTorrent(t *types.Torrent) error {
 		ct := CachedTorrent{
 			Torrent:    t,
 			IsComplete: len(t.Files) > 0,
+			IsIndexed:  true, // fully processed with file details
 			AddedOn:    addedOn,
 		}
 		c.setTorrent(ct, func(tor CachedTorrent) {
@@ -749,6 +771,132 @@ func (c *Cache) ProcessTorrent(t *types.Torrent) error {
 		})
 	}
 	return nil
+}
+
+// addSkeletonTorrent adds a torrent to the cache without file details and without persisting to disk.
+// On restart, skeleton entries are re-discovered from GetTorrents() as "new".
+func (c *Cache) addSkeletonTorrent(t CachedTorrent) {
+	torrentName := c.GetTorrentFolder(t.Torrent)
+	if torrentName == "" || torrentName == "." {
+		c.logger.Warn().Str("id", t.Id).Msg("Skeleton torrent has empty folder name, skipping")
+		return
+	}
+	c.torrents.set(torrentName, t)
+	// No SaveTorrent — skeleton entries are NOT persisted to disk
+}
+
+// backgroundIndex processes all unindexed (skeleton) torrents in background workers.
+func (c *Cache) backgroundIndex(ctx context.Context) {
+	unindexed := c.getUnindexedTorrents()
+	if len(unindexed) == 0 {
+		return
+	}
+
+	c.backgroundIndexing.Store(true)
+	defer c.backgroundIndexing.Store(false)
+
+	c.logger.Info().Msgf("Background indexing %d torrents...", len(unindexed))
+
+	workChan := make(chan *types.Torrent, min(c.workers, len(unindexed)))
+	var processed, errorCount int64
+	var wg sync.WaitGroup
+
+	for i := 0; i < c.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case t, ok := <-workChan:
+					if !ok {
+						return
+					}
+					if err := c.ProcessTorrent(t); err != nil {
+						c.logger.Error().Err(err).Str("torrent", t.Name).Msg("background index error")
+						atomic.AddInt64(&errorCount, 1)
+					}
+					count := atomic.AddInt64(&processed, 1)
+					if count%100 == 0 {
+						c.logger.Info().Msgf("Background indexing progress: %d/%d torrents", count, len(unindexed))
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	for _, t := range unindexed {
+		select {
+		case workChan <- t:
+		case <-ctx.Done():
+			break
+		}
+	}
+	close(workChan)
+	wg.Wait()
+
+	c.listingDebouncer.Call(false) // final listing refresh
+	c.logger.Info().Msgf("Background indexing complete: %d processed, %d errors", processed, errorCount)
+
+	// Refresh rclone VFS cache so mount sees newly-indexed files
+	if c.mounter != nil {
+		if err := c.mounter.RefreshDir([]string{"__all__"}); err != nil {
+			c.logger.Warn().Err(err).Msg("Failed to refresh rclone VFS after background indexing")
+		}
+	}
+}
+
+// EnsureIndexed fetches file details for an unindexed torrent on demand.
+// Uses singleflight to deduplicate concurrent requests and allow retries on failure.
+func (c *Cache) EnsureIndexed(torrentId string) error {
+	ct := c.GetTorrent(torrentId)
+	if ct == nil {
+		return fmt.Errorf("torrent not found: %s", torrentId)
+	}
+	if ct.IsIndexed {
+		return nil
+	}
+
+	_, err, _ := c.indexSG.Do(torrentId, func() (interface{}, error) {
+		// Re-check inside singleflight (another goroutine may have indexed it)
+		ct := c.GetTorrent(torrentId)
+		if ct != nil && ct.IsIndexed {
+			return nil, nil
+		}
+
+		t := ct.Torrent
+		if err := c.client.UpdateTorrent(t); err != nil {
+			return nil, fmt.Errorf("failed to index torrent on demand: %w", err)
+		}
+
+		// ProcessTorrent handles setting IsIndexed and saving
+		if err := c.ProcessTorrent(t); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+	return err
+}
+
+func (c *Cache) getUnindexedTorrents() []*types.Torrent {
+	result := make([]*types.Torrent, 0)
+	for _, ct := range c.torrents.getAll() {
+		if !ct.IsIndexed {
+			result = append(result, ct.Torrent)
+		}
+	}
+	return result
+}
+
+func (c *Cache) countUnindexed() int {
+	count := 0
+	for _, ct := range c.torrents.getAll() {
+		if !ct.IsIndexed {
+			count++
+		}
+	}
+	return count
 }
 
 func (c *Cache) Add(t *types.Torrent) error {

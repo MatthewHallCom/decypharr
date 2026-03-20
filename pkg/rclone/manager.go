@@ -292,23 +292,36 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
-// waitForServer waits for the RC server to become available
+// waitForServer waits for the RC server to become available with exponential backoff
 func (m *Manager) waitForServer() {
-	maxAttempts := 30
-	for i := 0; i < maxAttempts; i++ {
+	maxDuration := 2 * time.Minute
+	start := time.Now()
+	interval := 500 * time.Millisecond
+	maxInterval := 5 * time.Second
+	lastLog := start
+
+	for time.Since(start) < maxDuration {
 		if m.ctx.Err() != nil {
 			return
 		}
 
 		if m.pingServer() {
-			m.logger.Info().Msg("Rclone RC server is ready")
+			m.logger.Info().Msgf("Rclone RC server is ready (took %s)", time.Since(start).Round(time.Millisecond))
 			return
 		}
 
-		time.Sleep(time.Second)
+		if time.Since(lastLog) >= 15*time.Second {
+			m.logger.Warn().Msgf("Waiting for rclone RC server... (%ds elapsed)", int(time.Since(start).Seconds()))
+			lastLog = time.Now()
+		}
+
+		time.Sleep(interval)
+		if interval < maxInterval {
+			interval = min(interval*2, maxInterval)
+		}
 	}
 
-	m.logger.Error().Msg("Rclone RC server not responding - mount operations will be disabled")
+	m.logger.Error().Msg("Rclone RC server not responding after 2 minutes - mount operations will be disabled")
 }
 
 // pingServer checks if the RC server is responding

@@ -182,6 +182,18 @@ func (h *Handler) getChildren(name string) []os.FileInfo {
 	if len(parts) == 2 && utils.Contains(h.getParentItems(), parts[0]) {
 		torrentName := parts[1]
 		if t := h.cache.GetTorrentByName(torrentName); t != nil {
+			// Ensure torrent is fully indexed before returning file list
+			if !t.IsIndexed {
+				if err := h.cache.EnsureIndexed(t.Id); err != nil {
+					h.logger.Warn().Err(err).Str("torrent", torrentName).Msg("On-demand indexing failed")
+					return nil
+				}
+				// Re-fetch after indexing to get updated file list
+				t = h.cache.GetTorrentByName(torrentName)
+				if t == nil {
+					return nil
+				}
+			}
 			return h.getFileInfos(t)
 		}
 	}
@@ -236,6 +248,14 @@ func (h *Handler) OpenFile(ctx context.Context, name string, flag int, perm os.F
 		if utils.Contains(h.getParentItems(), parts[0]) {
 			torrentName := parts[1]
 			cached := h.cache.GetTorrentByName(torrentName)
+			// Ensure torrent is fully indexed before accessing files
+			if cached != nil && !cached.IsIndexed {
+				if err := h.cache.EnsureIndexed(cached.Id); err != nil {
+					h.logger.Warn().Err(err).Str("torrent", torrentName).Msg("On-demand indexing failed in OpenFile")
+					return nil, os.ErrNotExist
+				}
+				cached = h.cache.GetTorrentByName(torrentName)
+			}
 			if cached != nil && len(parts) >= 3 {
 				filename := filepath.Clean(path.Join(parts[2:]...))
 				if file, ok := cached.GetFile(filename); ok && !file.Deleted {

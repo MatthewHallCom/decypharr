@@ -94,6 +94,12 @@ func (c *Cache) refreshTorrents(ctx context.Context) {
 		return
 	}
 
+	// If background indexing is running, only handle deletions, skip new torrent processing
+	if c.backgroundIndexing.Load() {
+		c.logger.Debug().Msg("Background indexing active, skipping new torrent processing in refresh")
+		return
+	}
+
 	c.logger.Trace().Msgf("Found %d new torrents", len(newTorrents))
 
 	workChan := make(chan *types.Torrent, min(100, len(newTorrents)))

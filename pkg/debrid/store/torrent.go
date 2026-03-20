@@ -69,11 +69,12 @@ type torrentCache struct {
 }
 
 type sortableFile struct {
-	id      string
-	name    string
-	modTime time.Time
-	size    int64
-	bad     bool
+	id        string
+	name      string
+	modTime   time.Time
+	size      int64
+	bad       bool
+	isIndexed bool
 }
 
 func newTorrentCache(dirFilters map[string][]directoryFilter) *torrentCache {
@@ -284,7 +285,7 @@ func (tc *torrentCache) refreshListing() {
 	for name, index := range tc.nameIndex {
 		if index < len(tc.torrents) && !tc.torrents[index].deleted {
 			t := tc.torrents[index].CachedTorrent
-			all = append(all, sortableFile{t.Id, name, t.AddedOn, t.Bytes, t.Bad})
+			all = append(all, sortableFile{t.Id, name, t.AddedOn, t.Bytes, t.Bad, t.IsIndexed})
 		}
 	}
 	tc.sortNeeded.Store(false)
@@ -315,7 +316,7 @@ func (tc *torrentCache) refreshListing() {
 		defer wg.Done()
 		listing := make([]os.FileInfo, 0)
 		for _, sf := range all {
-			if sf.bad {
+			if sf.bad && sf.isIndexed {
 				listing = append(listing, &fileInfo{
 					id:      sf.id,
 					name:    fmt.Sprintf("%s || %s", sf.name, sf.id),
