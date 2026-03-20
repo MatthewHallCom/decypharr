@@ -797,34 +797,40 @@ func (c *Cache) backgroundIndex(ctx context.Context) {
 
 	c.logger.Info().Msgf("Background indexing %d torrents...", len(unindexed))
 
-	workChan := make(chan *types.Torrent, min(c.workers, len(unindexed)))
+	// Use a single worker for background indexing to avoid overwhelming the debrid API.
+	// On-demand indexing (EnsureIndexed) handles immediate user requests separately.
+	workChan := make(chan *types.Torrent, 1)
 	var processed, errorCount int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < c.workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case t, ok := <-workChan:
-					if !ok {
-						return
-					}
-					if err := c.ProcessTorrent(t); err != nil {
-						c.logger.Error().Err(err).Str("torrent", t.Name).Msg("background index error")
-						atomic.AddInt64(&errorCount, 1)
-					}
-					count := atomic.AddInt64(&processed, 1)
-					if count%100 == 0 {
-						c.logger.Info().Msgf("Background indexing progress: %d/%d torrents", count, len(unindexed))
-					}
-				case <-ctx.Done():
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case t, ok := <-workChan:
+				if !ok {
 					return
 				}
+				if err := c.ProcessTorrent(t); err != nil {
+					c.logger.Error().Err(err).Str("torrent", t.Name).Msg("background index error")
+					atomic.AddInt64(&errorCount, 1)
+					// Back off on errors to avoid hammering a rate-limited API
+					select {
+					case <-time.After(5 * time.Second):
+					case <-ctx.Done():
+						return
+					}
+				}
+				count := atomic.AddInt64(&processed, 1)
+				if count%100 == 0 {
+					c.logger.Info().Msgf("Background indexing progress: %d/%d torrents", count, len(unindexed))
+				}
+			case <-ctx.Done():
+				return
 			}
-		}()
-	}
+		}
+	}()
 
 	for _, t := range unindexed {
 		select {
