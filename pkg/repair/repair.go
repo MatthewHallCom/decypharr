@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -78,7 +77,7 @@ type Job struct {
 
 func New(arrs *arr.Storage, engine *debrid.Storage) *Repair {
 	cfg := config.Get()
-	workers := runtime.NumCPU() * 20
+	workers := 5
 	if cfg.Repair.Workers > 0 {
 		workers = cfg.Repair.Workers
 	}

@@ -103,6 +103,13 @@ func (c *Cache) GetBrokenFiles(t *CachedTorrent, filenames []string) []string {
 	var mu sync.Mutex
 	torrentWideFailed := false
 
+	// Cap concurrent CheckLink calls per torrent to avoid API flooding
+	checkConcurrency := config.Get().Repair.CheckConcurrency
+	if checkConcurrency <= 0 {
+		checkConcurrency = 5
+	}
+	sem := make(chan struct{}, checkConcurrency)
+
 	wg.Add(len(files))
 
 	for _, f := range files {
@@ -130,7 +137,16 @@ func (c *Cache) GetBrokenFiles(t *CachedTorrent, filenames []string) []string {
 				return
 			}
 
-			if err := c.client.CheckLink(f.Link); err != nil {
+			// Acquire semaphore before making API call
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			err := c.client.CheckLink(f.Link)
+			<-sem // release
+
+			if err != nil {
 				if errors.Is(err, utils.HosterUnavailableError) {
 					mu.Lock()
 					if repairStrategy == config.RepairStrategyPerTorrent {
