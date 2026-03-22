@@ -676,6 +676,11 @@ func (r *RealDebrid) getDownloadLink(account *account.Account, file *types.File)
 
 func (r *RealDebrid) GetDownloadLink(t *types.Torrent, file *types.File) (types.DownloadLink, error) {
 	accounts := r.accountsManager.Active()
+	if len(accounts) == 0 {
+		// All accounts disabled — force reset and retry
+		r.accountsManager.Reset()
+		accounts = r.accountsManager.Active()
+	}
 	for _, _account := range accounts {
 		downloadLink, err := r.getDownloadLink(_account, file)
 		if err == nil {

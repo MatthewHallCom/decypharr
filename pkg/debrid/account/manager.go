@@ -101,11 +101,15 @@ func (m *Manager) Current() *Account {
 	// Slow path - find new current account
 	activeAccounts := m.Active()
 	if len(activeAccounts) == 0 {
-		// No active accounts left — try to re-enable before giving up
-		m.CheckAndResetBandwidth()
+		// No active accounts left — force re-enable all accounts.
+		// Stale cached download links can cause false-positive bandwidth
+		// errors, so we reset unconditionally and let the next real API
+		// call determine if the account is truly over limit.
+		m.logger.Info().Str("debrid", m.debrid).Msg("All accounts disabled, resetting all accounts")
+		m.Reset()
 		activeAccounts = m.Active()
 		if len(activeAccounts) == 0 {
-			m.logger.Warn().Str("debrid", m.debrid).Msg("No active accounts available, all accounts are disabled")
+			m.logger.Error().Str("debrid", m.debrid).Msg("No accounts configured")
 			m.current.Store(nil)
 			return nil
 		}
