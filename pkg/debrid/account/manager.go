@@ -101,16 +101,14 @@ func (m *Manager) Current() *Account {
 	// Slow path - find new current account
 	activeAccounts := m.Active()
 	if len(activeAccounts) == 0 {
-		// No active accounts left, try to use disabled ones
-		m.logger.Warn().Str("debrid", m.debrid).Msg("No active accounts available, all accounts are disabled")
-		allAccounts := m.All()
-		if len(allAccounts) == 0 {
-			m.logger.Error().Str("debrid", m.debrid).Msg("No accounts configured")
+		// No active accounts left — try to re-enable before giving up
+		m.CheckAndResetBandwidth()
+		activeAccounts = m.Active()
+		if len(activeAccounts) == 0 {
+			m.logger.Warn().Str("debrid", m.debrid).Msg("No active accounts available, all accounts are disabled")
 			m.current.Store(nil)
 			return nil
 		}
-		m.current.Store(allAccounts[0])
-		return allAccounts[0]
 	}
 
 	newCurrent := activeAccounts[0]
@@ -217,9 +215,9 @@ func (m *Manager) Stats() []map[string]any {
 func (m *Manager) CheckAndResetBandwidth() {
 	found := false
 	m.accounts.Range(func(key string, acc *Account) bool {
-		if acc.Disabled.Load() && acc.DisableCount.Load() < MaxDisableCount {
+		if acc.Disabled.Load() {
 			if err := acc.CheckBandwidth(); err == nil {
-				acc.Disabled.Store(false)
+				acc.Reset() // clear both Disabled and DisableCount
 				found = true
 				m.logger.Info().Str("debrid", m.debrid).Str("token", utils.Mask(acc.Token)).Msg("Re-activated disabled account")
 			} else {

@@ -223,6 +223,7 @@ func (c *Cache) refreshTorrent(torrentId string) *CachedTorrent {
 		Torrent:    torrent,
 		AddedOn:    addedOn,
 		IsComplete: len(torrent.Files) > 0,
+		IsIndexed:  len(torrent.Files) > 0,
 	}
 	c.setTorrent(ct, func(torrent CachedTorrent) {
 		go c.listingDebouncer.Call(true)

@@ -97,7 +97,9 @@ func (a *Account) CheckBandwidth() error {
 		return true
 	})
 	if downloadLink == "" {
-		return fmt.Errorf("no download link found")
+		// No cached links to probe — we can't confirm the account is still
+		// over bandwidth, so optimistically allow re-enabling.
+		return nil
 	}
 
 	// Let's check the download link status
